@@ -71,6 +71,7 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
 
   let ffmpeg: FFmpegInstance | null = null;
   let mounted = false;
+  let inputDirectoryCreated = false;
   let abort: (() => void) | undefined;
   const onEncodeProgress = ({ progress }: { progress: number }) => onProgress(Math.max(5, Math.min(98, Math.round(progress * 100))));
   const onEncodeLog = ({ message }: { message: string }) => { if (/error|failed|not found/i.test(message)) console.warn("FFmpeg:", message.slice(0, 180)); };
@@ -95,6 +96,9 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
 
     // WORKERFS reads the original File in the worker without copying the full
     // video into a second in-memory Uint8Array.
+    // Emscripten requires the mount point to exist before mounting a filesystem.
+    await ffmpeg.createDir("/input");
+    inputDirectoryCreated = true;
     await ffmpeg.mount(FFFSType.WORKERFS, { blobs: [{ name: inputName, data: file }] }, "/input");
     mounted = true;
 
@@ -124,7 +128,8 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
     return { blob, name: file.name.replace(/\.[^.]+$/, "") + "-storysharp.mp4", ...meta, format: "MP4 · H.264/AAC" };
   } catch (error) {
     if (signal.aborted) throw cancelled();
-    throw new Error(error instanceof Error ? `Video processing failed: ${error.message}` : "Video processing failed. Try a smaller or browser-compatible file.");
+    const reason = error instanceof Error ? error.message : typeof error === "string" ? error : "Try a smaller or browser-compatible file.";
+    throw new Error(`Video processing failed: ${reason}`);
   } finally {
     if (abort) signal.removeEventListener("abort", abort);
     if (ffmpeg) {
@@ -132,6 +137,7 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
       ffmpeg.off("log", onEncodeLog);
       if (ffmpeg.loaded) {
         if (mounted) await ffmpeg.unmount("/input").catch(() => false);
+        if (inputDirectoryCreated) await ffmpeg.deleteDir("/input").catch(() => false);
         await ffmpeg.deleteFile("/result.mp4").catch(() => false);
         releaseWhenIdle(ffmpeg);
       }
