@@ -4,10 +4,13 @@ import { presetOptions, type Preset } from "./media";
 export type VideoOptions = { preset: Preset; fit: "fit" | "crop" | "blur"; fps: number | "preserve"; muted: boolean };
 export type VideoJob = { blob: Blob; name: string; width: number; height: number; duration: number; format: string };
 
-const CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd";
+const CORE_VERSION = "0.12.10";
+const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
+const CORE_MT_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@${CORE_VERSION}/dist/umd`;
 const WORKER_IDLE_TIMEOUT_MS = 60_000;
 let ffmpegInstance: FFmpegInstance | null = null;
 let ffmpegLoading: Promise<FFmpegInstance> | null = null;
+let ffmpegWorkerBlobUrl = "";
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 let conversionActive = false;
 
@@ -24,30 +27,44 @@ async function getFFmpeg(FFmpeg: typeof import("@ffmpeg/ffmpeg").FFmpeg, signal:
   ffmpegInstance = ffmpeg;
   let coreBlob = "";
   let wasmBlob = "";
+  let workerBlob = "";
   let loadTimer: ReturnType<typeof setTimeout> | undefined;
   let loading!: Promise<FFmpegInstance>;
   loading = (async () => {
-    const [coreResponse, wasmResponse] = await Promise.all([
-      fetch(`${CORE_BASE}/ffmpeg-core.js`, { signal }),
-      fetch(`${CORE_BASE}/ffmpeg-core.wasm`, { signal }),
-    ]);
-    if (!coreResponse.ok || !wasmResponse.ok) throw new Error("The video engine could not be downloaded.");
+    // SharedArrayBuffer is available only on cross-origin-isolated pages. Use
+    // FFmpeg's multi-threaded core there; retain the single-thread core fallback.
+    const multithreaded = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+    const base = multithreaded ? CORE_MT_BASE : CORE_BASE;
+    const files = multithreaded
+      ? ["ffmpeg-core.js", "ffmpeg-core.wasm", "ffmpeg-core.worker.js"]
+      : ["ffmpeg-core.js", "ffmpeg-core.wasm"];
+    const responses = await Promise.all(files.map((name) => fetch(`${base}/${name}`, { signal })));
+    if (responses.some((response) => !response.ok)) throw new Error("The video engine could not be downloaded.");
+    const [coreResponse, wasmResponse, workerResponse] = responses;
     coreBlob = URL.createObjectURL(new Blob([await coreResponse.blob()], { type: "text/javascript" }));
     wasmBlob = URL.createObjectURL(new Blob([await wasmResponse.blob()], { type: "application/wasm" }));
+    if (workerResponse) workerBlob = URL.createObjectURL(new Blob([await workerResponse.blob()], { type: "text/javascript" }));
     await Promise.race([
-      ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob }, { signal }),
+      ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob, ...(workerBlob ? { workerURL: workerBlob } : {}) }, { signal }),
       new Promise<never>((_, reject) => { loadTimer = setTimeout(() => reject(new Error("The video engine did not start within 60 seconds.")), 60_000); }),
     ]);
     if (signal.aborted) throw cancelled();
+    // The core may create pthread workers during later FFmpeg commands, so keep
+    // its worker script URL alive until this FFmpeg instance is terminated.
+    ffmpegWorkerBlobUrl = workerBlob;
+    workerBlob = "";
     return ffmpeg;
   })().catch((error: unknown) => {
     ffmpeg.terminate();
+    if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
+    ffmpegWorkerBlobUrl = "";
     if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
     throw error;
   }).finally(() => {
     if (loadTimer) clearTimeout(loadTimer);
     if (coreBlob) URL.revokeObjectURL(coreBlob);
     if (wasmBlob) URL.revokeObjectURL(wasmBlob);
+    if (workerBlob) URL.revokeObjectURL(workerBlob);
     if (ffmpegLoading === loading) ffmpegLoading = null;
   });
   ffmpegLoading = loading;
@@ -60,6 +77,8 @@ function releaseWhenIdle(ffmpeg: FFmpegInstance) {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
     ffmpeg.terminate();
+    if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
+    ffmpegWorkerBlobUrl = "";
     if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
     idleTimer = undefined;
   }, WORKER_IDLE_TIMEOUT_MS);
@@ -86,6 +105,8 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
 
     abort = () => {
       ffmpeg?.terminate();
+      if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
+      ffmpegWorkerBlobUrl = "";
       if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = undefined;
@@ -103,9 +124,9 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
     mounted = true;
 
     const scale = options.fit === "crop"
-      ? "scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2:flags=lanczos,crop=1080:1920"
-      : "scale=w='min(1080,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black";
-    const blurFilter = "[0:v]split=2[background][foreground];[background]scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2,crop=1080:1920,gblur=sigma=28[bg];[foreground]scale=w='min(1080,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]";
+      ? "scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2:flags=fast_bilinear,crop=1080:1920"
+      : "scale=w='min(1080,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black";
+    const blurFilter = "[0:v]split=2[background][foreground];[background]scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2:flags=fast_bilinear,crop=1080:1920,gblur=sigma=28[bg];[foreground]scale=w='min(1080,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]";
     const args = ["-i", inputPath];
     if (options.fit === "blur") args.push("-filter_complex", blurFilter, "-map", "[v]", "-map", "0:a?");
     else args.push("-vf", `${scale},setsar=1`);
