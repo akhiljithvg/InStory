@@ -6,11 +6,9 @@ export type VideoJob = { blob: Blob; name: string; width: number; height: number
 
 const CORE_VERSION = "0.12.10";
 const CORE_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
-const CORE_MT_BASE = `https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@${CORE_VERSION}/dist/umd`;
 const WORKER_IDLE_TIMEOUT_MS = 60_000;
 let ffmpegInstance: FFmpegInstance | null = null;
 let ffmpegLoading: Promise<FFmpegInstance> | null = null;
-let ffmpegWorkerBlobUrl = "";
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 let conversionActive = false;
 
@@ -23,34 +21,25 @@ async function getFFmpeg(FFmpeg: typeof import("@ffmpeg/ffmpeg").FFmpeg, signal:
   if (ffmpegInstance?.loaded) return ffmpegInstance;
   if (ffmpegLoading) return ffmpegLoading;
 
-  const loadCore = async (multithreaded: boolean): Promise<FFmpegInstance> => {
+  const loadCore = async (): Promise<FFmpegInstance> => {
     const ffmpeg = new FFmpeg();
     ffmpegInstance = ffmpeg;
     let coreBlob = "";
     let wasmBlob = "";
-    let workerBlob = "";
     let loadTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-    const base = multithreaded ? CORE_MT_BASE : CORE_BASE;
-    const files = multithreaded
-      ? ["ffmpeg-core.js", "ffmpeg-core.wasm", "ffmpeg-core.worker.js"]
-      : ["ffmpeg-core.js", "ffmpeg-core.wasm"];
-    const responses = await Promise.all(files.map((name) => fetch(`${base}/${name}`, { signal })));
-    if (responses.some((response) => !response.ok)) throw new Error("The video engine could not be downloaded.");
-    const [coreResponse, wasmResponse, workerResponse] = responses;
-    coreBlob = URL.createObjectURL(new Blob([await coreResponse.blob()], { type: "text/javascript" }));
-    wasmBlob = URL.createObjectURL(new Blob([await wasmResponse.blob()], { type: "application/wasm" }));
-    if (workerResponse) workerBlob = URL.createObjectURL(new Blob([await workerResponse.blob()], { type: "text/javascript" }));
-    await Promise.race([
-      ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob, ...(workerBlob ? { workerURL: workerBlob } : {}) }, { signal }),
-      new Promise<never>((_, reject) => { loadTimer = setTimeout(() => reject(new Error("The video engine did not start.")), multithreaded ? 20_000 : 60_000); }),
-    ]);
-    if (signal.aborted) throw cancelled();
-    // The core may create pthread workers during later FFmpeg commands, so keep
-    // its worker script URL alive until this FFmpeg instance is terminated.
-    ffmpegWorkerBlobUrl = workerBlob;
-    workerBlob = "";
-    return ffmpeg;
+      const files = ["ffmpeg-core.js", "ffmpeg-core.wasm"];
+      const responses = await Promise.all(files.map((name) => fetch(`${CORE_BASE}/${name}`, { signal })));
+      if (responses.some((response) => !response.ok)) throw new Error("The video engine could not be downloaded.");
+      const [coreResponse, wasmResponse] = responses;
+      coreBlob = URL.createObjectURL(new Blob([await coreResponse.blob()], { type: "text/javascript" }));
+      wasmBlob = URL.createObjectURL(new Blob([await wasmResponse.blob()], { type: "application/wasm" }));
+      await Promise.race([
+        ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob }, { signal }),
+        new Promise<never>((_, reject) => { loadTimer = setTimeout(() => reject(new Error("The video engine did not start within 60 seconds. Check your connection and reload the page.")), 60_000); }),
+      ]);
+      if (signal.aborted) throw cancelled();
+      return ffmpeg;
     } catch (error) {
       ffmpeg.terminate();
       if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
@@ -59,23 +48,15 @@ async function getFFmpeg(FFmpeg: typeof import("@ffmpeg/ffmpeg").FFmpeg, signal:
       if (loadTimer) clearTimeout(loadTimer);
       if (coreBlob) URL.revokeObjectURL(coreBlob);
       if (wasmBlob) URL.revokeObjectURL(wasmBlob);
-      if (workerBlob) URL.revokeObjectURL(workerBlob);
     }
   };
 
   let loading!: Promise<FFmpegInstance>;
   loading = (async () => {
-    // SharedArrayBuffer is available only on cross-origin-isolated pages. Try
-    // the multi-threaded core there, then fall back quickly if it cannot start.
-    const multithreaded = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
-    if (!multithreaded) return loadCore(false);
-    try {
-      return await loadCore(true);
-    } catch (error) {
-      if (signal.aborted) throw cancelled();
-      console.warn("Multi-threaded video engine failed to start; using the compatible fallback.", error);
-      return loadCore(false);
-    }
+    // Run the compatible core directly. A timed-out multi-threaded startup
+    // followed by a second 60-second startup can leave mobile users waiting
+    // several minutes before they see a useful error.
+    return loadCore();
   })().finally(() => {
     if (ffmpegLoading === loading) ffmpegLoading = null;
   });
@@ -89,8 +70,6 @@ function releaseWhenIdle(ffmpeg: FFmpegInstance) {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
     ffmpeg.terminate();
-    if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
-    ffmpegWorkerBlobUrl = "";
     if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
     idleTimer = undefined;
   }, WORKER_IDLE_TIMEOUT_MS);
@@ -117,8 +96,6 @@ export async function transcodeVideo(file: File, options: VideoOptions, onProgre
 
     abort = () => {
       ffmpeg?.terminate();
-      if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
-      ffmpegWorkerBlobUrl = "";
       if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = undefined;
