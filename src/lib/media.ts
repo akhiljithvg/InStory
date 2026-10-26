@@ -82,7 +82,7 @@ export async function inspectVideo(file: File, format: string): Promise<MediaInf
 export type Preset = "maximum" | "balanced" | "smaller";
 export const presetOptions: Record<Preset, { label: string; description: string; crf: number; preset: string }> = {
   maximum: { label: "Maximum quality", description: "Preserve detail; output may be larger.", crf: 18, preset: "slow" },
-  balanced: { label: "Balanced", description: "A practical balance for most Stories.", crf: 23, preset: "medium" },
+  balanced: { label: "Balanced", description: "Faster encoding at the same quality target; output may be slightly larger.", crf: 23, preset: "veryfast" },
   smaller: { label: "Smaller file", description: "More compression; fine detail may soften.", crf: 28, preset: "fast" },
 };
 
