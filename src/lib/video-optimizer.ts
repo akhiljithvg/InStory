@@ -23,17 +23,14 @@ async function getFFmpeg(FFmpeg: typeof import("@ffmpeg/ffmpeg").FFmpeg, signal:
   if (ffmpegInstance?.loaded) return ffmpegInstance;
   if (ffmpegLoading) return ffmpegLoading;
 
-  const ffmpeg = new FFmpeg();
-  ffmpegInstance = ffmpeg;
-  let coreBlob = "";
-  let wasmBlob = "";
-  let workerBlob = "";
-  let loadTimer: ReturnType<typeof setTimeout> | undefined;
-  let loading!: Promise<FFmpegInstance>;
-  loading = (async () => {
-    // SharedArrayBuffer is available only on cross-origin-isolated pages. Use
-    // FFmpeg's multi-threaded core there; retain the single-thread core fallback.
-    const multithreaded = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+  const loadCore = async (multithreaded: boolean): Promise<FFmpegInstance> => {
+    const ffmpeg = new FFmpeg();
+    ffmpegInstance = ffmpeg;
+    let coreBlob = "";
+    let wasmBlob = "";
+    let workerBlob = "";
+    let loadTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
     const base = multithreaded ? CORE_MT_BASE : CORE_BASE;
     const files = multithreaded
       ? ["ffmpeg-core.js", "ffmpeg-core.wasm", "ffmpeg-core.worker.js"]
@@ -46,7 +43,7 @@ async function getFFmpeg(FFmpeg: typeof import("@ffmpeg/ffmpeg").FFmpeg, signal:
     if (workerResponse) workerBlob = URL.createObjectURL(new Blob([await workerResponse.blob()], { type: "text/javascript" }));
     await Promise.race([
       ffmpeg.load({ coreURL: coreBlob, wasmURL: wasmBlob, ...(workerBlob ? { workerURL: workerBlob } : {}) }, { signal }),
-      new Promise<never>((_, reject) => { loadTimer = setTimeout(() => reject(new Error("The video engine did not start within 60 seconds.")), 60_000); }),
+      new Promise<never>((_, reject) => { loadTimer = setTimeout(() => reject(new Error("The video engine did not start.")), multithreaded ? 20_000 : 60_000); }),
     ]);
     if (signal.aborted) throw cancelled();
     // The core may create pthread workers during later FFmpeg commands, so keep
@@ -54,17 +51,32 @@ async function getFFmpeg(FFmpeg: typeof import("@ffmpeg/ffmpeg").FFmpeg, signal:
     ffmpegWorkerBlobUrl = workerBlob;
     workerBlob = "";
     return ffmpeg;
-  })().catch((error: unknown) => {
-    ffmpeg.terminate();
-    if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
-    ffmpegWorkerBlobUrl = "";
-    if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
-    throw error;
-  }).finally(() => {
-    if (loadTimer) clearTimeout(loadTimer);
-    if (coreBlob) URL.revokeObjectURL(coreBlob);
-    if (wasmBlob) URL.revokeObjectURL(wasmBlob);
-    if (workerBlob) URL.revokeObjectURL(workerBlob);
+    } catch (error) {
+      ffmpeg.terminate();
+      if (ffmpegInstance === ffmpeg) ffmpegInstance = null;
+      throw error;
+    } finally {
+      if (loadTimer) clearTimeout(loadTimer);
+      if (coreBlob) URL.revokeObjectURL(coreBlob);
+      if (wasmBlob) URL.revokeObjectURL(wasmBlob);
+      if (workerBlob) URL.revokeObjectURL(workerBlob);
+    }
+  };
+
+  let loading!: Promise<FFmpegInstance>;
+  loading = (async () => {
+    // SharedArrayBuffer is available only on cross-origin-isolated pages. Try
+    // the multi-threaded core there, then fall back quickly if it cannot start.
+    const multithreaded = globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+    if (!multithreaded) return loadCore(false);
+    try {
+      return await loadCore(true);
+    } catch (error) {
+      if (signal.aborted) throw cancelled();
+      console.warn("Multi-threaded video engine failed to start; using the compatible fallback.", error);
+      return loadCore(false);
+    }
+  })().finally(() => {
     if (ffmpegLoading === loading) ffmpegLoading = null;
   });
   ffmpegLoading = loading;
