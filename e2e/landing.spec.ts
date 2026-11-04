@@ -63,3 +63,26 @@ test("transcodes a small browser-created WebM through FFmpeg.wasm", async ({ pag
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toMatch(/\.mp4$/);
 });
+
+test("transcodes video with soft fill blur background", async ({ page }) => {
+  test.setTimeout(180_000);
+  await page.goto("/");
+  const bytes = await page.evaluate(async () => {
+    const canvas = document.createElement("canvas"); canvas.width = 320; canvas.height = 180;
+    const ctx = canvas.getContext("2d")!; const stream = canvas.captureStream(8);
+    const recorder = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8" });
+    const parts: BlobPart[] = []; recorder.ondataavailable = (event) => { if (event.data.size) parts.push(event.data); };
+    const stopped = new Promise<void>((resolve) => { recorder.onstop = () => resolve(); });
+    recorder.start();
+    for (let frame = 0; frame < 6; frame++) { ctx.fillStyle = frame % 2 ? "#ff70a6" : "#241734"; ctx.fillRect(0, 0, canvas.width, canvas.height); await new Promise((resolve) => setTimeout(resolve, 100)); }
+    recorder.stop(); await stopped; stream.getTracks().forEach((track) => track.stop());
+    const blob = new Blob(parts, { type: "video/webm" });
+    return Array.from(new Uint8Array(await blob.arrayBuffer()));
+  });
+  await page.locator('input[type="file"]').setInputFiles({ name: "landscape.webm", mimeType: "video/webm", buffer: Buffer.from(bytes) });
+  await expect(page.getByText("Media inspection")).toBeVisible();
+  await page.getByRole("button", { name: "Soft fill" }).click();
+  await page.getByRole("button", { name: "Convert video to H.264" }).click();
+  await expect(page.getByText("Optimization complete")).toBeVisible({ timeout: 150_000 });
+  await expect(page.getByText(/MP4 · H\.264\/AAC/)).toBeVisible();
+});
